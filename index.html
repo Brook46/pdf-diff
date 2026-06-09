@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="PDF Diff" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+  <link rel="stylesheet" href="./app.css" />
+  <title>PDF Diff &amp; Annotate</title>
+</head>
+<body data-theme="auto">
+  <script src="./vendor/pdf-lib.min.js"></script>
+
+  <header class="app-header" role="banner">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3" y="3" width="18" height="18" rx="2.5" />
+        <line x1="12" y1="3" x2="12" y2="21" />
+        <path d="M14 8 L19 8 L19 12 Z" class="brand-mark" />
+      </svg>
+      <span class="brand-name">PDF Diff</span>
+    </div>
+    <button class="icon-btn" id="theme-btn" title="Cycle theme (Auto / Light / Dark)" aria-label="Cycle theme"></button>
+  </header>
+
+  <!-- INPUT screen ---------------------------------------------------- -->
+  <main class="screen screen-landing" id="screen-input">
+    <h1 class="screen-title">Carry annotations forward</h1>
+    <p class="screen-subtitle">Drop your annotated old PDF and the new revised PDF. We'll move every highlight, note, and pencil mark onto the matching text in the new file — and flag anything whose text has changed.</p>
+
+    <div class="dropzones">
+      <label class="dropzone" data-slot="old" id="dz-old">
+        <input type="file" accept="application/pdf" hidden />
+        <div class="dz-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M6 3 H14 L18 7 V21 H6 Z" />
+            <path d="M14 3 V7 H18" />
+            <line x1="8" y1="11" x2="16" y2="11" class="hl-mark" />
+            <line x1="8" y1="14" x2="14" y2="14" />
+          </svg>
+        </div>
+        <div class="dz-label">Old (annotated)</div>
+        <div class="dz-hint">Tap, drop, or paste a PDF</div>
+        <div class="dz-filename" data-filename></div>
+      </label>
+
+      <label class="dropzone" data-slot="new" id="dz-new">
+        <input type="file" accept="application/pdf" hidden />
+        <div class="dz-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M6 3 H14 L18 7 V21 H6 Z" />
+            <path d="M14 3 V7 H18" />
+            <line x1="8" y1="11" x2="16" y2="11" />
+            <line x1="8" y1="14" x2="16" y2="14" />
+            <line x1="8" y1="17" x2="13" y2="17" />
+          </svg>
+        </div>
+        <div class="dz-label">New (revised)</div>
+        <div class="dz-hint">Tap, drop, or paste a PDF</div>
+        <div class="dz-filename" data-filename></div>
+      </label>
+    </div>
+
+    <div class="landing-actions">
+      <button class="primary-btn" id="go-btn" disabled>Carry annotations →</button>
+    </div>
+  </main>
+
+  <!-- WORKING screen -------------------------------------------------- -->
+  <main class="screen screen-working" id="screen-working" hidden>
+    <div class="working-stack">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="working-msg" id="working-msg">Reading…</div>
+    </div>
+  </main>
+
+  <!-- RESULT screen --------------------------------------------------- -->
+  <main class="screen screen-result" id="screen-result" hidden>
+    <h1 class="screen-title">Done.</h1>
+    <p class="screen-subtitle" id="result-subtitle"></p>
+
+    <div class="stat-row">
+      <div class="stat ok">
+        <div class="stat-num" id="stat-carried">0</div>
+        <div class="stat-label">carried over</div>
+      </div>
+      <div class="stat warn">
+        <div class="stat-num" id="stat-stale">0</div>
+        <div class="stat-label">flagged as changed</div>
+      </div>
+    </div>
+
+    <details class="stale-list" id="stale-details" hidden>
+      <summary>Show flagged items</summary>
+      <ul id="stale-list"></ul>
+    </details>
+
+    <div class="result-actions">
+      <button class="primary-btn" id="share-btn">Share / save PDF</button>
+      <button class="ghost-btn" id="reset-btn">Start over</button>
+    </div>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
