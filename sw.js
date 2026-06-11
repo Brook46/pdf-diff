@@ -1,5 +1,5 @@
 /* PDF Diff — minimal service worker (cache-first app shell, offline-capable). */
-const CACHE_VERSION = 'pdf-diff-v4';
+const CACHE_VERSION = 'pdf-diff-v5';
 const APP_SHELL = [
   './',
   './index.html',
@@ -18,6 +18,9 @@ const APP_SHELL = [
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE_VERSION).then((c) => c.addAll(APP_SHELL)).then(() => self.skipWaiting()));
+});
+self.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
