@@ -24,7 +24,12 @@ const LOAD_OPTS = {
   parseSpeed: 1500,
 };
 
-const SEARCH_RADIUS = 8;
+// How many pages either side of the proportional anchor we look at.
+// 25 catches Boeing-style section restructures without being so wide that
+// short anchors match a random other instance of the same word.
+const SEARCH_RADIUS = 25;
+// Number of context words on each side of the highlight used to disambiguate.
+const CONTEXT_WORDS = 4;
 
 export async function carry(oldBlob, newBlob, onProgress = () => {}) {
   onProgress('Reading PDFs…');
@@ -94,19 +99,21 @@ export async function carry(oldBlob, newBlob, onProgress = () => {}) {
 
     if (TEXT_SUBTYPES.has(a.subtype)) {
       const oldPage = await oldIndex.get(a.page);
-      const anchor = extractAnchorTextFromQuads(oldPage, a.quads);
-      if (!anchor || anchor.length < 3) continue;
-      const hit = await searchInIndex(newIndex, anchor, expected, SEARCH_RADIUS);
+      const info = extractAnchorWithContext(oldPage, a.quads, CONTEXT_WORDS);
+      if (!info || !isUsableAnchor(info.anchor)) continue;   // silently drop noise
+      const hit = await findBestMatch(newIndex, info, expected, SEARCH_RADIUS);
       if (hit) {
         addTextMark(newDoc, hit.pageIndex, a.subtype, hit.quads, a.color, a.contents, ledger);
         carried++;
-      } else {
-        stale.push({ subtype: a.subtype, oldPage: a.page + 1, text: anchor });
+      } else if (info.anchor.split(/\s+/).length >= 2) {
+        // Only flag genuinely missing multi-word anchors. Single-word misses
+        // are usually noise we couldn't pin down, not an actual change.
+        stale.push({ subtype: a.subtype, oldPage: a.page + 1, text: info.anchor });
       }
     } else if (a.subtype === 'FreeText') {
       const oldPage = await oldIndex.get(a.page);
-      const phrase = pickPhrase(extractWordsInRect(oldPage, a.rect, 4), 6);
-      const hit = phrase ? await searchInIndex(newIndex, phrase, expected, SEARCH_RADIUS) : null;
+      const phrase = pickPhrase(extractWordsInRect(oldPage, a.rect, 4), 8);
+      const hit = phrase ? await findBestMatch(newIndex, { anchor: phrase, prefix: '', suffix: '' }, expected, SEARCH_RADIUS) : null;
       const target = hit
         ? { pageIndex: hit.pageIndex, x: hit.rect.x0, y: hit.rect.y0 }
         : { pageIndex: expected, x: 36, y: 36 };
@@ -114,14 +121,14 @@ export async function carry(oldBlob, newBlob, onProgress = () => {}) {
       carried++;
     } else if (GEO_SUBTYPES.has(a.subtype)) {
       const oldPage = await oldIndex.get(a.page);
-      const phrase = pickPhrase(extractWordsAboveRect(oldPage, a.rect, 50), 6);
+      const phrase = pickPhrase(extractWordsAboveRect(oldPage, a.rect, 50), 8);
       let dx = 0, dy = 0, targetPage = expected;
       if (phrase) {
-        const hit = await searchInIndex(newIndex, phrase, expected, SEARCH_RADIUS);
+        const hit = await findBestMatch(newIndex, { anchor: phrase, prefix: '', suffix: '' }, expected, SEARCH_RADIUS);
         if (hit) {
           const oldHit = locateWordsInPage(oldPage, phrase);
-          if (oldHit.length) {
-            const oldR = boundQuads(oldHit);
+          if (oldHit && oldHit.quads.length) {
+            const oldR = boundQuads(oldHit.quads);
             dx = hit.rect.x0 - oldR.x0;
             dy = hit.rect.y0 - oldR.y0;
             targetPage = hit.pageIndex;
@@ -448,30 +455,116 @@ class LazyIndex {
   }
 }
 
-async function searchInIndex(index, needle, startPage, radius) {
-  const tries = spiral(startPage, radius, index.numPages);
-  for (const pi of tries) {
-    const page = await index.get(pi);
-    if (!page) continue;
-    if (page.norm.includes(normalize(needle))) {
-      const quads = locateWordsInPage(page, needle);
-      if (quads.length) return { pageIndex: pi, quads, rect: boundQuads(quads) };
-    }
-  }
-  for (const k of [6, 4]) {
-    const short = needle.split(/\s+/).slice(0, k).join(' ');
-    if (short.length < 8 || short === needle) continue;
-    const sn = normalize(short);
+// Best-match lookup with disambiguating context.
+//
+// Strategy: build a sequence of progressively shorter queries from
+// "prefix + anchor + suffix" (most specific, lowest false-positive rate)
+// down to "anchor alone" (riskiest). For each query, find ALL matches in
+// the spiral around `expected`. Pick the one closest to `expected`.
+// For specific (context-padded) queries we accept any match. For the bare
+// anchor we require proximity ≤ radius/2 — otherwise a 2-word highlight
+// like "approach speed" would happily land 200 pages away in a different
+// chapter.
+async function findBestMatch(index, info, expected, radius) {
+  const { anchor, prefix, suffix } = info;
+  if (!anchor) return null;
+  const aWords = wordsOf(anchor);
+
+  const queries = [];
+  if (prefix && suffix) queries.push({ text: `${prefix} ${anchor} ${suffix}`, offset: wordsOf(prefix).length, count: aWords.length, strict: false });
+  if (prefix)            queries.push({ text: `${prefix} ${anchor}`,           offset: wordsOf(prefix).length, count: aWords.length, strict: false });
+  if (suffix)            queries.push({ text: `${anchor} ${suffix}`,           offset: 0,                      count: aWords.length, strict: false });
+  queries.push({ text: anchor, offset: 0, count: aWords.length, strict: aWords.length < 4 });
+
+  const tries = spiral(expected, radius, index.numPages);
+
+  for (const q of queries) {
+    if (q.text.length < 3) continue;
+    const hits = [];
+    const nq = normalize(q.text);
     for (const pi of tries) {
       const page = await index.get(pi);
-      if (!page) continue;
-      if (page.norm.includes(sn)) {
-        const quads = locateWordsInPage(page, short);
-        if (quads.length) return { pageIndex: pi, quads, rect: boundQuads(quads) };
-      }
+      if (!page || !page.norm.includes(nq)) continue;
+      const located = locateWordsInPage(page, q.text);
+      if (!located) continue;
+      hits.push({ pageIndex: pi, ...located });
     }
+    if (!hits.length) continue;
+    hits.sort((a, b) => Math.abs(a.pageIndex - expected) - Math.abs(b.pageIndex - expected));
+    const pick = hits[0];
+    if (q.strict && Math.abs(pick.pageIndex - expected) > Math.max(3, radius >> 1)) {
+      // Bare short anchor — only accept nearby matches.
+      continue;
+    }
+    // Trim quads to just the anchor portion when the query was context-padded.
+    const matchedSpan = pick.wordEnd - pick.wordStart;
+    if (q.offset > 0 || q.count < matchedSpan) {
+      const page = await index.get(pick.pageIndex);
+      const aStart = pick.wordStart + q.offset;
+      const aEnd = aStart + q.count;
+      const slice = page.words.slice(aStart, aEnd);
+      const quads = buildLineQuads(slice);
+      if (quads.length) return { pageIndex: pick.pageIndex, quads, rect: boundQuads(quads) };
+    }
+    return { pageIndex: pick.pageIndex, quads: pick.quads, rect: boundQuads(pick.quads) };
   }
   return null;
+}
+
+function wordsOf(s) { return (s || '').trim().split(/\s+/).filter(Boolean); }
+
+// Treat empty, whitespace, or single-character anchors as noise we should
+// drop silently — they have no meaningful target in the new PDF.
+function isUsableAnchor(s) {
+  if (!s) return false;
+  const clean = s.replace(/[\s\p{P}]+/gu, '');
+  return clean.length >= 3;
+}
+
+// Pull the highlighted text, plus a small prefix/suffix window of nearby
+// words on the old page, by mapping the quad rects back to word indices
+// in pageInfo.words.
+function extractAnchorWithContext(pageInfo, quads, contextWords) {
+  if (!pageInfo || !quads || !quads.length) return null;
+  const seen = new Set();
+  for (const q of quads) {
+    const xs = [q.x1, q.x2, q.x3, q.x4];
+    const ys = [q.y1, q.y2, q.y3, q.y4];
+    const rect = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
+    for (let i = 0; i < pageInfo.words.length; i++) {
+      const w = pageInfo.words[i];
+      const cx = w.x + w.w / 2, cy = w.y;
+      if (cx >= rect.x0 - 1 && cx <= rect.x1 + 1 && cy >= rect.y0 - 1 && cy <= rect.y1 + 1) seen.add(i);
+    }
+  }
+  if (!seen.size) return null;
+  const sorted = [...seen].sort((a, b) => a - b);
+  const start = sorted[0], end = sorted[sorted.length - 1] + 1;
+  const anchor = pageInfo.words.slice(start, end).map((w) => w.text).join(' ');
+  const prefix = pageInfo.words.slice(Math.max(0, start - contextWords), start).map((w) => w.text).join(' ');
+  const suffix = pageInfo.words.slice(end, Math.min(pageInfo.words.length, end + contextWords)).map((w) => w.text).join(' ');
+  return { anchor, prefix, suffix };
+}
+
+function buildLineQuads(words) {
+  if (!words || !words.length) return [];
+  const runs = [];
+  let cur = null;
+  for (const w of words) {
+    if (cur && Math.abs(w.y - cur.y) <= 2) {
+      cur.x1 = Math.max(cur.x1, w.x + w.w);
+      cur.h = Math.max(cur.h, w.h);
+    } else {
+      if (cur) runs.push(cur);
+      cur = { x0: w.x, y: w.y, x1: w.x + w.w, h: w.h };
+    }
+  }
+  if (cur) runs.push(cur);
+  return runs.map((r) => ({
+    x1: r.x0, y1: r.y + r.h,  x2: r.x1, y2: r.y + r.h,
+    x3: r.x0, y3: r.y,        x4: r.x1, y4: r.y,
+    rect: { x0: r.x0, y0: r.y, x1: r.x1, y1: r.y + r.h },
+  }));
 }
 
 function spiral(center, radius, count) {
@@ -538,22 +631,6 @@ function pdfjsInk(ink) {
 
 function normalize(s) { return s.replace(/\s+/g, ' ').trim().toLowerCase(); }
 
-function extractAnchorTextFromQuads(pageInfo, quads) {
-  if (!pageInfo || !quads || !quads.length) return '';
-  const out = [];
-  for (const q of quads) {
-    const xs = [q.x1, q.x2, q.x3, q.x4];
-    const ys = [q.y1, q.y2, q.y3, q.y4];
-    const rect = { x0: Math.min(...xs), y0: Math.min(...ys), x1: Math.max(...xs), y1: Math.max(...ys) };
-    for (const w of pageInfo.words) {
-      const cx = w.x + w.w / 2, cy = w.y;
-      if (cx >= rect.x0 - 1 && cx <= rect.x1 + 1 && cy >= rect.y0 - 1 && cy <= rect.y1 + 1) out.push(w.text);
-    }
-  }
-  const cleaned = [];
-  for (const t of out) if (cleaned[cleaned.length - 1] !== t) cleaned.push(t);
-  return cleaned.join(' ');
-}
 function extractWordsInRect(pageInfo, rect, pad = 0) {
   if (!pageInfo) return [];
   const [x0, y0, x1, y1] = [rect[0]-pad, rect[1]-pad, rect[2]+pad, rect[3]+pad];
@@ -572,9 +649,10 @@ function extractWordsAboveRect(pageInfo, rect, h = 50) {
 }
 function pickPhrase(words, n) { return words && words.length ? words.slice(0, n).join(' ') : ''; }
 
+// Returns null if not found, otherwise { wordStart, wordEnd, quads }.
 function locateWordsInPage(page, needle) {
   const target = normalize(needle).split(' ').filter(Boolean);
-  if (!target.length) return [];
+  if (!target.length) return null;
   const words = page.words;
   for (let i = 0; i <= words.length - target.length; i++) {
     let ok = true;
@@ -582,27 +660,11 @@ function locateWordsInPage(page, needle) {
       if (normalize(words[i + j].text) !== target[j]) { ok = false; break; }
     }
     if (ok) {
-      const runs = [];
-      let cur = null;
-      for (let j = 0; j < target.length; j++) {
-        const w = words[i + j];
-        if (cur && Math.abs(w.y - cur.y) <= 2) {
-          cur.x1 = Math.max(cur.x1, w.x + w.w);
-          cur.h = Math.max(cur.h, w.h);
-        } else {
-          if (cur) runs.push(cur);
-          cur = { x0: w.x, y: w.y, x1: w.x + w.w, h: w.h };
-        }
-      }
-      if (cur) runs.push(cur);
-      return runs.map((r) => ({
-        x1: r.x0, y1: r.y + r.h, x2: r.x1, y2: r.y + r.h,
-        x3: r.x0, y3: r.y,        x4: r.x1, y4: r.y,
-        rect: { x0: r.x0, y0: r.y, x1: r.x1, y1: r.y + r.h },
-      }));
+      const slice = words.slice(i, i + target.length);
+      return { wordStart: i, wordEnd: i + target.length, quads: buildLineQuads(slice) };
     }
   }
-  return [];
+  return null;
 }
 function boundQuads(quads) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -623,20 +685,38 @@ function yieldToUI() { return new Promise((r) => setTimeout(r, 0)); }
 // Share / download
 // ---------------------------------------------------------------------------
 
+// Single-fire lock — prevents a second click of the share button from
+// triggering a second download while the first is still in-flight.
+let sharing = false;
+
 export async function shareOrDownload(blob, filename) {
-  const file = new File([blob], filename, { type: 'application/pdf' });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: filename });
-      return { shared: true };
-    } catch (err) {
-      if (err && err.name === 'AbortError') return { shared: false, cancelled: true };
+  if (sharing) return { shared: false, busy: true };
+  sharing = true;
+  try {
+    // On a touch device the iOS/iPadOS share sheet is the right UX; on
+    // desktop, calling navigator.share triggers Safari's share menu but
+    // many platforms ALSO drop a file in ~/Downloads, producing two files.
+    // Just download on desktop.
+    const touch = ('ontouchstart' in window) || (navigator.maxTouchPoints || 0) > 1;
+    const file = new File([blob], filename, { type: 'application/pdf' });
+    if (touch && navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: filename });
+        return { shared: true };
+      } catch (err) {
+        if (err && err.name === 'AbortError') return { shared: false, cancelled: true };
+        // Any other error → fall through to download.
+      }
     }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    await new Promise((r) => setTimeout(r, 600));
+    URL.revokeObjectURL(url); a.remove();
+    return { shared: false };
+  } finally {
+    // Brief cooldown so a stray second click is debounced.
+    setTimeout(() => { sharing = false; }, 1200);
   }
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
-  return { shared: false };
 }

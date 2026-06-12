@@ -1,5 +1,5 @@
 /* PDF Diff — minimal service worker (cache-first app shell, offline-capable). */
-const CACHE_VERSION = 'pdf-diff-v5';
+const CACHE_VERSION = 'pdf-diff-v6';
 const APP_SHELL = [
   './',
   './index.html',

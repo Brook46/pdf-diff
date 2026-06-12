@@ -2,30 +2,14 @@
 
 import { carry, shareOrDownload } from './src/carry.js';
 
-// Service worker + auto-update.
-// If a new SW is available we install it and reload once it's controlling
-// the page, so users always get the latest code on next launch.
+// Register the service worker. Updates apply on the NEXT manual launch —
+// we deliberately don't auto-reload mid-session because that can interrupt
+// an in-progress carry/download and cause the share button to double-fire.
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', async () => {
     try {
       const reg = await navigator.serviceWorker.register('./sw.js');
       reg.update().catch(() => {});
-      reg.addEventListener('updatefound', () => {
-        const sw = reg.installing;
-        if (!sw) return;
-        sw.addEventListener('statechange', () => {
-          if (sw.state === 'installed' && navigator.serviceWorker.controller) {
-            // New version is installed and an old controller is still active.
-            // Take over right away.
-            sw.postMessage({ type: 'SKIP_WAITING' });
-          }
-        });
-      });
-      let reloading = false;
-      navigator.serviceWorker.addEventListener('controllerchange', () => {
-        if (reloading) return; reloading = true;
-        location.reload();
-      });
     } catch {}
   });
 }
