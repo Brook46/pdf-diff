@@ -143,7 +143,7 @@ export async function carry(oldBlob, newBlob, onProgress = () => {}) {
   }
 
   onProgress('Writing incremental update…');
-  const updateBytes = buildIncrementalUpdate(newBytes, newDoc, ledger, xrefInfo);
+  const updateBytes = await buildIncrementalUpdate(newBytes, newDoc, ledger, xrefInfo);
   const outBlob = new Blob([newBytes, updateBytes], { type: 'application/pdf' });
   return { blob: outBlob, carried, stale, message: null };
 }
@@ -157,42 +157,42 @@ export async function carry(oldBlob, newBlob, onProgress = () => {}) {
 // previous xref. A renderer reads the latest xref last → finds the new objects.
 
 function locateOriginalXref(bytes) {
-  // Scan the last 2 KB for "startxref\n<N>\n%%EOF" (with possible \r\n).
-  // The xref may be a classical "xref" table OR an xref-stream object
-  // (PDF 1.5+). Either is fine — our classical appendix's /Prev can point
-  // at either format and PDF readers will follow the chain.
-  const tailLen = Math.min(2048, bytes.length);
+  // Find the LAST "startxref\n<N>\n%%EOF" block — many PDFs already contain
+  // their own incremental updates so there can be several startxref markers
+  // and we need to chain to the *most recent* one. matchAll + pick-last
+  // (regex.match without /g returns only the FIRST, which is the wrong one).
+  const tailLen = Math.min(8192, bytes.length);
   const tail = bytes.subarray(bytes.length - tailLen);
   const decoded = new TextDecoder('latin1').decode(tail);
-  const m = decoded.match(/startxref\s+(\d+)\s+%%EOF/);
-  if (!m) return null;
-  return { prevXref: parseInt(m[1], 10) };
+  const matches = [...decoded.matchAll(/startxref\s+(\d+)\s+%%EOF/g)];
+  if (matches.length === 0) return null;
+  const last = matches[matches.length - 1];
+  return { prevXref: parseInt(last[1], 10) };
 }
 
-function buildIncrementalUpdate(originalBytes, doc, ledger, xrefInfo) {
+// We emit our incremental update's xref as a PDF 1.5+ **xref stream** rather
+// than a classical "xref" table. That keeps the format consistent with the
+// original Boeing PDFs (which use xref streams) and satisfies strict readers
+// like Apple's PDFKit (macOS Preview, iOS Files) — they refuse to follow a
+// `/Prev` pointer from a classical table to an xref stream of a different
+// format. xref streams are the canonical incremental-update format for any
+// PDF 1.5+ file.
+async function buildIncrementalUpdate(originalBytes, doc, ledger, xrefInfo) {
   const enc = new TextEncoder();
   const chunks = [];
   let cursor = originalBytes.length;
 
-  // PDF spec: incremental sections must start on a fresh line.
   if (originalBytes[originalBytes.length - 1] !== 0x0A) {
     chunks.push(new Uint8Array([0x0A]));
     cursor += 1;
   }
 
-  // Re-serialize each modified page (it now has additional /Annots refs).
-  // Each modified page keeps its original (objNum, gen) so renderers replace
-  // the existing entry.
-  const pageRefs = [];
-  for (const { ref, page } of ledger.modifiedPages.values()) {
-    pageRefs.push({ ref, body: page.node });
-  }
+  // Modified pages (rewritten with new /Annots) + brand-new annotation objects.
+  const writes = [];
+  for (const { ref, page } of ledger.modifiedPages.values()) writes.push({ ref, body: page.node });
+  for (const ref of ledger.newRefs) writes.push({ ref, body: doc.context.lookup(ref) });
 
-  // New annotation objects get freshly-allocated obj numbers (pdf-lib did
-  // this for us when we registered them).
-  const annotRefs = ledger.newRefs.map((ref) => ({ ref, body: doc.context.lookup(ref) }));
-
-  const entries = [];           // { objNum, gen, offset }
+  const entries = [];           // { objNum, gen, offset } for every indirect we write
   const writeIndirect = ({ ref, body }) => {
     const header = enc.encode(`${ref.objectNumber} ${ref.generationNumber} obj\n`);
     chunks.push(header);
@@ -212,65 +212,77 @@ function buildIncrementalUpdate(originalBytes, doc, ledger, xrefInfo) {
     entries.push({ objNum: ref.objectNumber, gen: ref.generationNumber, offset });
   };
 
-  for (const e of pageRefs)  writeIndirect(e);
-  for (const e of annotRefs) writeIndirect(e);
+  for (const e of writes) writeIndirect(e);
 
-  // -------- xref subsection --------
-  const xrefStart = cursor;
-  entries.sort((a, b) => a.objNum - b.objNum);
+  // ---------------- xref stream ----------------
+  // The xref stream IS itself an indirect object. Allocate the next obj number
+  // for it (pdf-lib's largestObjectNumber already includes our additions).
+  const xrefObjNum = doc.context.largestObjectNumber + 1;
+  const xrefObjOffset = cursor;
 
-  // Always include the free-list head entry (object 0).
-  // We group consecutive object numbers into subsections per spec.
-  const subsections = [];
-  // Object 0, always a single entry.
-  subsections.push({ start: 0, rows: [{ offset: 0, gen: 65535, type: 'f' }] });
+  // Final xref entries — include obj 0 (free list head), every modified/new
+  // object, and the xref stream itself (which is also a "new" object).
+  const allEntries = [
+    { objNum: 0, type: 0, field2: 0, field3: 65535 },
+    ...entries.map((e) => ({ objNum: e.objNum, type: 1, field2: e.offset, field3: e.gen })),
+    { objNum: xrefObjNum, type: 1, field2: xrefObjOffset, field3: 0 },
+  ];
+  allEntries.sort((a, b) => a.objNum - b.objNum);
 
+  // Group into contiguous /Index [start count …] subsections.
+  const index = [];
   let i = 0;
-  while (i < entries.length) {
+  while (i < allEntries.length) {
     let j = i;
-    while (j + 1 < entries.length && entries[j + 1].objNum === entries[j].objNum + 1) j++;
-    const rows = [];
-    for (let k = i; k <= j; k++) {
-      rows.push({ offset: entries[k].offset, gen: entries[k].gen, type: 'n' });
-    }
-    subsections.push({ start: entries[i].objNum, rows });
+    while (j + 1 < allEntries.length && allEntries[j + 1].objNum === allEntries[j].objNum + 1) j++;
+    index.push(allEntries[i].objNum, j - i + 1);
     i = j + 1;
   }
 
-  let xrefStr = 'xref\n';
-  for (const sub of subsections) {
-    xrefStr += `${sub.start} ${sub.rows.length}\n`;
-    for (const row of sub.rows) {
-      xrefStr += row.offset.toString().padStart(10, '0') + ' ' +
-                 row.gen.toString().padStart(5, '0') + ' ' + row.type + ' \n';
-    }
+  // Binary payload: /W [1 4 2] → 7 bytes per entry.
+  const payload = new Uint8Array(allEntries.length * 7);
+  let p = 0;
+  for (const e of allEntries) {
+    payload[p++] = e.type & 0xff;
+    payload[p++] = (e.field2 >>> 24) & 0xff;
+    payload[p++] = (e.field2 >>> 16) & 0xff;
+    payload[p++] = (e.field2 >>> 8)  & 0xff;
+    payload[p++] = (e.field2)        & 0xff;
+    payload[p++] = (e.field3 >>> 8)  & 0xff;
+    payload[p++] = (e.field3)        & 0xff;
   }
-  chunks.push(enc.encode(xrefStr));
-  cursor += xrefStr.length;
+  const compressed = await deflate(payload);
 
-  // -------- trailer --------
+  // Trailer metadata reused from the loaded doc.
   const trailer = doc.context.trailerInfo || {};
   const rootRef = trailer.Root;
   const infoRef = trailer.Info;
   const id = trailer.ID;
-  const newSize = doc.context.largestObjectNumber + 1;
+  const newSize = xrefObjNum + 1;
 
-  let trailerStr = `trailer\n<< /Size ${newSize} /Prev ${xrefInfo.prevXref}`;
+  let dictStr = `<< /Type /XRef /Size ${newSize} /Prev ${xrefInfo.prevXref}`;
+  dictStr += ` /W [ 1 4 2 ] /Index [ ${index.join(' ')} ]`;
   if (rootRef && rootRef.objectNumber !== undefined) {
-    trailerStr += ` /Root ${rootRef.objectNumber} ${rootRef.generationNumber} R`;
+    dictStr += ` /Root ${rootRef.objectNumber} ${rootRef.generationNumber} R`;
   }
   if (infoRef && infoRef.objectNumber !== undefined) {
-    trailerStr += ` /Info ${infoRef.objectNumber} ${infoRef.generationNumber} R`;
+    dictStr += ` /Info ${infoRef.objectNumber} ${infoRef.generationNumber} R`;
   }
   if (id) {
-    // ID is a PDFArray of two PDFHexString — copy its bytes.
     const idSize = id.sizeInBytes();
     const idBuf = new Uint8Array(idSize);
     id.copyBytesInto(idBuf, 0);
-    trailerStr += ' /ID ' + new TextDecoder('latin1').decode(idBuf);
+    dictStr += ' /ID ' + new TextDecoder('latin1').decode(idBuf);
   }
-  trailerStr += ` >>\nstartxref\n${xrefStart}\n%%EOF\n`;
-  chunks.push(enc.encode(trailerStr));
+  dictStr += ` /Filter /FlateDecode /Length ${compressed.length} >>`;
+
+  const xrefObjHeader = enc.encode(`${xrefObjNum} 0 obj\n${dictStr}\nstream\n`);
+  chunks.push(xrefObjHeader);
+  cursor += xrefObjHeader.length;
+  chunks.push(compressed);
+  cursor += compressed.length;
+  const xrefObjFooter = enc.encode(`\nendstream\nendobj\nstartxref\n${xrefObjOffset}\n%%EOF\n`);
+  chunks.push(xrefObjFooter);
 
   // Concatenate.
   const total = chunks.reduce((s, c) => s + c.length, 0);
@@ -278,6 +290,25 @@ function buildIncrementalUpdate(originalBytes, doc, ledger, xrefInfo) {
   let off = 0;
   for (const c of chunks) { out.set(c, off); off += c.length; }
   return out;
+}
+
+// Compress with zlib (deflate-with-zlib-header). /FlateDecode expects this format.
+async function deflate(bytes) {
+  const cs = new CompressionStream('deflate');
+  const writer = cs.writable.getWriter();
+  writer.write(bytes); writer.close();
+  const reader = cs.readable.getReader();
+  const out = [];
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    out.push(value);
+  }
+  const total = out.reduce((s, c) => s + c.length, 0);
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const c of out) { merged.set(c, off); off += c.length; }
+  return merged;
 }
 
 // ---------------------------------------------------------------------------
