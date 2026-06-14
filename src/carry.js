@@ -101,7 +101,13 @@ export async function carry(oldBlob, newBlob, onProgress = () => {}) {
       const oldPage = await oldIndex.get(a.page);
       const info = extractAnchorWithContext(oldPage, a.quads, CONTEXT_WORDS);
       if (!info || !isUsableAnchor(info.anchor)) continue;   // silently drop noise
-      const hit = await findBestMatch(newIndex, info, expected, SEARCH_RADIUS);
+      // Smart radius: 6+ word anchors are unique enough to scan the whole
+      // document for; shorter anchors stay at the default 25-page window
+      // (their context block + closest-to-expected scoring already prevents
+      // pulling us into a different chapter).
+      const aWordCount = wordsOf(info.anchor).length;
+      const radius = aWordCount >= 6 ? nNew : SEARCH_RADIUS;
+      const hit = await findBestMatch(newIndex, info, expected, radius);
       if (hit) {
         addTextMark(newDoc, hit.pageIndex, a.subtype, hit.quads, a.color, a.contents, ledger);
         carried++;
@@ -438,7 +444,12 @@ class LazyIndex {
       const x = tx[4], y = tx[5];
       const itemW = item.width || (item.str.length * fontSize * 0.5);
       const itemH = item.height || fontSize;
-      const parts = item.str.split(/(\s+)/).filter(Boolean);
+      // Split on whitespace AND inner punctuation that Boeing PDFs love
+      // (slash, comma, semicolon, parens, dash, dot in mid-string) so e.g.
+      // "Cruise/Driftdown" → ["Cruise","/","Driftdown"]. The matcher then
+      // skips the empty-after-normalize separator tokens and "Cruise
+      // Driftdown" lines up with the needle.
+      const parts = item.str.split(/(\s+|[\/,;:()\[\]"])/).filter(Boolean);
       let cursor = 0;
       const total = item.str.length || 1;
       for (const part of parts) {
@@ -449,6 +460,19 @@ class LazyIndex {
         cursor += part.length;
       }
     }
+    // De-hyphenate soft-wrapped words: "auto-\nthrottle" gets emitted as two
+    // tokens "auto-" then "throttle" on adjacent lines. Merge them so the
+    // index has the original logical word — otherwise searches for
+    // "auto-throttle" or "autothrottle" miss.
+    for (let i = 0; i < words.length - 1; i++) {
+      const a = words[i], b = words[i + 1];
+      if (/-$/.test(a.text) && Math.abs(a.y - b.y) > a.h * 0.5) {
+        a.text = a.text.replace(/-$/, '') + b.text;
+        a.w = (a.w || 0) + (b.w || 0);
+        words.splice(i + 1, 1);
+        i--;
+      }
+    }
     const info = { width: vp.width, height: vp.height, words, norm: normalize(words.map((w) => w.text).join(' ')) };
     this.cache.set(pageIndex, info);
     return info;
@@ -457,29 +481,29 @@ class LazyIndex {
 
 // Best-match lookup with disambiguating context.
 //
-// Strategy: build a sequence of progressively shorter queries from
-// "prefix + anchor + suffix" (most specific, lowest false-positive rate)
-// down to "anchor alone" (riskiest). For each query, find ALL matches in
-// the spiral around `expected`. Pick the one closest to `expected`.
-// For specific (context-padded) queries we accept any match. For the bare
-// anchor we require proximity ≤ radius/2 — otherwise a 2-word highlight
-// like "approach speed" would happily land 200 pages away in a different
-// chapter.
-async function findBestMatch(index, info, expected, radius) {
+// Each query has its own search radius based on how UNIQUE it is:
+//  - Context-padded queries (anchor + prefix and/or suffix) are highly
+//    unique, so we search the WHOLE document — no risk of false positives.
+//  - The bare-anchor fallback is restricted to a local window so that
+//    short anchors like "approach" don't grab a stray occurrence in a
+//    different chapter.
+async function findBestMatch(index, info, expected, localRadius) {
   const { anchor, prefix, suffix } = info;
   if (!anchor) return null;
   const aWords = wordsOf(anchor);
+  const N = index.numPages;
 
   const queries = [];
-  if (prefix && suffix) queries.push({ text: `${prefix} ${anchor} ${suffix}`, offset: wordsOf(prefix).length, count: aWords.length, strict: false });
-  if (prefix)            queries.push({ text: `${prefix} ${anchor}`,           offset: wordsOf(prefix).length, count: aWords.length, strict: false });
-  if (suffix)            queries.push({ text: `${anchor} ${suffix}`,           offset: 0,                      count: aWords.length, strict: false });
-  queries.push({ text: anchor, offset: 0, count: aWords.length, strict: aWords.length < 4 });
-
-  const tries = spiral(expected, radius, index.numPages);
+  if (prefix && suffix) queries.push({ text: `${prefix} ${anchor} ${suffix}`, offset: wordsOf(prefix).length, count: aWords.length, radius: N });
+  if (prefix)            queries.push({ text: `${prefix} ${anchor}`,           offset: wordsOf(prefix).length, count: aWords.length, radius: N });
+  if (suffix)            queries.push({ text: `${anchor} ${suffix}`,           offset: 0,                      count: aWords.length, radius: N });
+  // Bare anchor: full doc only when anchor itself is long enough to be
+  // self-disambiguating; otherwise stay local.
+  queries.push({ text: anchor, offset: 0, count: aWords.length, radius: aWords.length >= 6 ? N : localRadius, strict: aWords.length < 4 });
 
   for (const q of queries) {
     if (q.text.length < 3) continue;
+    const tries = spiral(expected, q.radius, N);
     const hits = [];
     const nq = normalize(q.text);
     for (const pi of tries) {
@@ -492,10 +516,7 @@ async function findBestMatch(index, info, expected, radius) {
     if (!hits.length) continue;
     hits.sort((a, b) => Math.abs(a.pageIndex - expected) - Math.abs(b.pageIndex - expected));
     const pick = hits[0];
-    if (q.strict && Math.abs(pick.pageIndex - expected) > Math.max(3, radius >> 1)) {
-      // Bare short anchor — only accept nearby matches.
-      continue;
-    }
+    if (q.strict && Math.abs(pick.pageIndex - expected) > Math.max(3, localRadius >> 1)) continue;
     // Trim quads to just the anchor portion when the query was context-padded.
     const matchedSpan = pick.wordEnd - pick.wordStart;
     if (q.offset > 0 || q.count < matchedSpan) {
@@ -629,7 +650,29 @@ function pdfjsInk(ink) {
 // Anchor / word helpers
 // ---------------------------------------------------------------------------
 
-function normalize(s) { return s.replace(/\s+/g, ' ').trim().toLowerCase(); }
+// Normalize for matching: lowercase, collapse whitespace, fold ligatures and
+// curly quotes, strip punctuation/symbols. This is used for the page-level
+// substring filter and for word-by-word comparison so "approach," == "approach"
+// and "• Engine Fire" == "engine fire".
+const LIGATURES = { 'ﬁ': 'fi', 'ﬂ': 'fl', 'ﬃ': 'ffi', 'ﬄ': 'ffl', 'ﬅ': 'st', 'ﬆ': 'st' };
+function normalize(s) {
+  if (!s) return '';
+  return s
+    .replace(/[ﬁﬂﬃﬄﬅﬆ]/g, (c) => LIGATURES[c])
+    .replace(/[‐-―−]/g, '-')      // various hyphens/dashes → ASCII '-'
+    .replace(/[‘’‚‛]/g, "'") // curly single quotes → '
+    .replace(/[“”„‟]/g, '"') // curly double quotes → "
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')         // strip punctuation/symbols (keep apostrophe + hyphen)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Per-word normalize: like normalize() but also strips dangling apostrophes/hyphens
+// so "approach." matches "approach" and "—" tokens drop out entirely.
+function wnorm(s) {
+  return normalize(s).replace(/^['-]+|['-]+$/g, '');
+}
 
 function extractWordsInRect(pageInfo, rect, pad = 0) {
   if (!pageInfo) return [];
@@ -650,18 +693,28 @@ function extractWordsAboveRect(pageInfo, rect, h = 50) {
 function pickPhrase(words, n) { return words && words.length ? words.slice(0, n).join(' ') : ''; }
 
 // Returns null if not found, otherwise { wordStart, wordEnd, quads }.
+// Skips empty tokens (standalone punctuation like "-" that normalize() drops),
+// so "Takeoff - Engine Failure" still matches the query "takeoff engine failure".
 function locateWordsInPage(page, needle) {
   const target = normalize(needle).split(' ').filter(Boolean);
   if (!target.length) return null;
   const words = page.words;
-  for (let i = 0; i <= words.length - target.length; i++) {
-    let ok = true;
-    for (let j = 0; j < target.length; j++) {
-      if (normalize(words[i + j].text) !== target[j]) { ok = false; break; }
+  if (!page.wnorm) page.wnorm = words.map((w) => wnorm(w.text));
+  const wn = page.wnorm;
+
+  for (let i = 0; i < words.length; i++) {
+    if (!wn[i]) continue;
+    let wi = i, ti = 0;
+    let lastMatched = i;
+    while (ti < target.length && wi < words.length) {
+      if (!wn[wi]) { wi++; continue; }
+      if (wn[wi] !== target[ti]) break;
+      lastMatched = wi;
+      wi++; ti++;
     }
-    if (ok) {
-      const slice = words.slice(i, i + target.length);
-      return { wordStart: i, wordEnd: i + target.length, quads: buildLineQuads(slice) };
+    if (ti === target.length) {
+      const slice = words.slice(i, lastMatched + 1).filter((_, k) => !!wn[i + k]);
+      return { wordStart: i, wordEnd: lastMatched + 1, quads: buildLineQuads(slice) };
     }
   }
   return null;
