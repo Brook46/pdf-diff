@@ -130,32 +130,22 @@ export async function carry(oldBlob, newBlob, onProgress = () => {}) {
         // are usually noise we couldn't pin down, not an actual change.
         stale.push({ subtype: a.subtype, oldPage: a.page + 1, text: info.anchor });
       }
-    } else if (a.subtype === 'FreeText') {
+    } else if (a.subtype === 'FreeText' || GEO_SUBTYPES.has(a.subtype)) {
+      // Both FreeText and Geometry use the same delta-translation approach:
+      // find a stable anchor phrase near the annotation in the OLD PDF, find
+      // that phrase in the NEW PDF, and shift the annotation by the same delta.
+      // That preserves the original rect's relationship to surrounding text.
       const oldPage = await oldIndex.get(a.page);
-      const phrase = pickPhrase(extractWordsInRect(oldPage, a.rect, 4), 8);
-      const hit = phrase ? await findBestMatch(newIndex, { anchor: phrase, prefix: '', suffix: '' }, expected, SEARCH_RADIUS) : null;
-      const target = hit
-        ? { pageIndex: hit.pageIndex, x: hit.rect.x0, y: hit.rect.y0 }
-        : { pageIndex: expected, x: 36, y: 36 };
-      addFreeText(newDoc, target.pageIndex, target.x, target.y, a, a.color, a.contents, ledger);
-      carried++;
-    } else if (GEO_SUBTYPES.has(a.subtype)) {
-      const oldPage = await oldIndex.get(a.page);
-      const phrase = pickPhrase(extractWordsAboveRect(oldPage, a.rect, 50), 8);
-      let dx = 0, dy = 0, targetPage = expected;
-      if (phrase) {
-        const hit = await findBestMatch(newIndex, { anchor: phrase, prefix: '', suffix: '' }, expected, SEARCH_RADIUS);
-        if (hit) {
-          const oldHit = locateWordsInPage(oldPage, phrase);
-          if (oldHit && oldHit.quads.length) {
-            const oldR = boundQuads(oldHit.quads);
-            dx = hit.rect.x0 - oldR.x0;
-            dy = hit.rect.y0 - oldR.y0;
-            targetPage = hit.pageIndex;
-          }
-        }
+      const xlate = await translateByAnchor(oldPage, a.rect, newIndex, expected);
+      const targetPage = xlate ? xlate.targetPage : expected;
+      const dx = xlate ? xlate.dx : 0;
+      const dy = xlate ? xlate.dy : 0;
+      const newRect = [a.rect[0] + dx, a.rect[1] + dy, a.rect[2] + dx, a.rect[3] + dy];
+      if (a.subtype === 'FreeText') {
+        addFreeText(newDoc, targetPage, newRect, a, a.color, a.contents, ledger);
+      } else {
+        addGeometry(newDoc, targetPage, a, dx, dy, ledger);
       }
-      addGeometry(newDoc, targetPage, a, dx, dy, ledger);
       carried++;
     }
   }
@@ -360,12 +350,9 @@ function addTextMark(doc, pageIndex, subtype, quads, color, contents, ledger) {
   appendAnnot(page, ctx, dict, ledger);
 }
 
-function addFreeText(doc, pageIndex, x, y, oldAnnot, color, contents, ledger) {
+function addFreeText(doc, pageIndex, rect, oldAnnot, color, contents, ledger) {
   const ctx = doc.context;
   const page = doc.getPage(pageIndex);
-  const w = Math.max(180, oldAnnot.rect[2] - oldAnnot.rect[0]);
-  const h = Math.max(40, oldAnnot.rect[3] - oldAnnot.rect[1]);
-  const rect = [x, Math.max(20, y - h), x + w, y];
 
   // Preserve the original font and color where possible. PDF.js parses these
   // into defaultAppearanceData; fall back to plain Helvetica if absent.
@@ -375,9 +362,6 @@ function addFreeText(doc, pageIndex, x, y, oldAnnot, color, contents, ledger) {
   const fc = da?.fontColor && da.fontColor.length >= 3
     ? `${(da.fontColor[0]/255).toFixed(3)} ${(da.fontColor[1]/255).toFixed(3)} ${(da.fontColor[2]/255).toFixed(3)} rg`
     : '0 0 0 rg';
-  // Font name in /DA must be a PDF name (e.g. /Helv, /HeBo); if Boeing
-  // referenced a system font like "HelveticaNeue-Bold" most readers map it
-  // to a generic equivalent. We sanitize spaces but keep the name.
   const daStr = `/${fontName.replace(/[^A-Za-z0-9]/g, '')} ${fontSize} Tf ${fc}`;
 
   const dictBody = {
@@ -722,6 +706,45 @@ function extractWordsAboveRect(pageInfo, rect, h = 50) {
     const cx = w.x + w.w / 2, cy = w.y;
     return cx >= rect[0] - 20 && cx <= x1 + 20 && cy >= y1 && cy <= y1 + h;
   }).map((w) => w.text);
+}
+function extractWordsBelowRect(pageInfo, rect, h = 60) {
+  if (!pageInfo) return [];
+  const [x0, y0, x1] = rect;
+  return pageInfo.words.filter((w) => {
+    const cx = w.x + w.w / 2, cy = w.y;
+    return cx >= x0 - 20 && cx <= x1 + 20 && cy <= y0 && cy >= y0 - h;
+  }).map((w) => w.text);
+}
+
+// Compute the (dx, dy) shift and target page for an annotation by finding
+// the most stable nearby text anchor. Tries (in order):
+//   1. Text INSIDE the annotation rect — best when the annotation overlays
+//      text (most FreeText notes, highlights on a region)
+//   2. Text just above the rect — best for figure captions / Ink on figures
+//   3. Text just below the rect — best when the annotation sits above a body
+//      paragraph (Square boxes around a header, e.g.)
+// First phrase that locates in BOTH old and new PDFs wins.
+async function translateByAnchor(oldPage, oldRect, newIndex, expected) {
+  if (!oldPage) return null;
+  const candidates = [
+    pickPhrase(extractWordsInRect(oldPage, oldRect, 4), 8),
+    pickPhrase(extractWordsAboveRect(oldPage, oldRect, 70), 8),
+    pickPhrase(extractWordsBelowRect(oldPage, oldRect, 70), 8),
+  ].filter((p) => p && p.length >= 8);
+
+  for (const phrase of candidates) {
+    const oldHit = locateWordsInPage(oldPage, phrase);
+    if (!oldHit || !oldHit.quads.length) continue;
+    const newHit = await findBestMatch(newIndex, { anchor: phrase, prefix: '', suffix: '' }, expected, SEARCH_RADIUS);
+    if (!newHit) continue;
+    const oldR = boundQuads(oldHit.quads);
+    return {
+      targetPage: newHit.pageIndex,
+      dx: newHit.rect.x0 - oldR.x0,
+      dy: newHit.rect.y0 - oldR.y0,
+    };
+  }
+  return null;
 }
 function pickPhrase(words, n) { return words && words.length ? words.slice(0, n).join(' ') : ''; }
 
