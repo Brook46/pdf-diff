@@ -11,7 +11,21 @@
 import * as pdfjsLib from '../vendor/pdfjs/pdf.mjs';
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.mjs', import.meta.url).href;
 
-const { PDFDocument, PDFName, PDFString, PDFRef, PDFArray } = window.PDFLib;
+const { PDFDocument, PDFName, PDFString, PDFHexString, PDFRef, PDFArray } = window.PDFLib;
+
+// Encode a JS string for use as a PDF text string. PDFHexString.fromText
+// writes UTF-16 BE bytes prefixed with a BOM (FEFF) wrapped in hex — the PDF
+// spec-mandated representation for non-ASCII text. PDFString.of() truncates
+// each char to a byte and mangles anything outside Latin-1 (so Hebrew or
+// Arabic comes out as gibberish in the saved PDF).
+function pdfText(s) { return PDFHexString.fromText(s || ''); }
+
+// Heuristic: does this string contain right-to-left script (Hebrew/Arabic)?
+function isRTL(s) {
+  if (!s) return false;
+  // Hebrew U+0590–U+05FF, Arabic U+0600–U+06FF, U+0700–U+07BF, presentation forms
+  return /[֐-׿؀-ۿ܀-޿יִ-﷿ﹰ-﻿]/.test(s);
+}
 
 const TEXT_SUBTYPES = new Set(['Highlight', 'Underline', 'Squiggly', 'StrikeOut']);
 const GEO_SUBTYPES  = new Set(['Ink', 'Square', 'Circle', 'Line']);
@@ -339,8 +353,8 @@ function addTextMark(doc, pageIndex, subtype, quads, color, contents, ledger) {
     Rect: [r.x0, r.y0, r.x1, r.y1],
     QuadPoints: qp,
     C: color.slice(0, 3),
-    Contents: PDFString.of(contents || ''),
-    T: PDFString.of('Carried'),
+    Contents: pdfText(contents),
+    T: pdfText('Carried'),
     F: 4, CA: 0.55,
   });
   appendAnnot(page, ctx, dict, ledger);
@@ -352,15 +366,32 @@ function addFreeText(doc, pageIndex, x, y, oldAnnot, color, contents, ledger) {
   const w = Math.max(180, oldAnnot.rect[2] - oldAnnot.rect[0]);
   const h = Math.max(40, oldAnnot.rect[3] - oldAnnot.rect[1]);
   const rect = [x, Math.max(20, y - h), x + w, y];
-  const dict = ctx.obj({
+
+  // Preserve the original font and color where possible. PDF.js parses these
+  // into defaultAppearanceData; fall back to plain Helvetica if absent.
+  const da = oldAnnot.defaultAppearanceData;
+  const fontName = da?.fontName || 'Helv';
+  const fontSize = da?.fontSize || 10;
+  const fc = da?.fontColor && da.fontColor.length >= 3
+    ? `${(da.fontColor[0]/255).toFixed(3)} ${(da.fontColor[1]/255).toFixed(3)} ${(da.fontColor[2]/255).toFixed(3)} rg`
+    : '0 0 0 rg';
+  // Font name in /DA must be a PDF name (e.g. /Helv, /HeBo); if Boeing
+  // referenced a system font like "HelveticaNeue-Bold" most readers map it
+  // to a generic equivalent. We sanitize spaces but keep the name.
+  const daStr = `/${fontName.replace(/[^A-Za-z0-9]/g, '')} ${fontSize} Tf ${fc}`;
+
+  const dictBody = {
     Type: 'Annot', Subtype: 'FreeText',
     Rect: rect,
-    Contents: PDFString.of(contents || ''),
-    DA: PDFString.of('/Helv 10 Tf 0 0 0 rg'),
+    Contents: pdfText(contents),
+    DA: PDFString.of(daStr),
     C: color.slice(0, 3),
-    T: PDFString.of('Carried note'),
+    T: pdfText('Carried note'),
     F: 4,
-  });
+  };
+  // /Q: 0 left, 1 center, 2 right. Hebrew/Arabic must render right-aligned.
+  if (isRTL(contents)) dictBody.Q = 2;
+  const dict = ctx.obj(dictBody);
   appendAnnot(page, ctx, dict, ledger);
 }
 
@@ -374,7 +405,7 @@ function addGeometry(doc, pageIndex, a, dx, dy, ledger) {
       Type: 'Annot', Subtype: a.subtype,
       Rect: r, C: a.color.slice(0, 3),
       BS: ctx.obj({ W: 1.5 }),
-      Contents: PDFString.of(a.contents || ''), F: 4,
+      Contents: pdfText(a.contents), F: 4,
     });
     if (a.subtype === 'Line') dict.set(PDFName.of('L'), ctx.obj([r[0], r[1], r[2], r[3]]));
   } else if (a.subtype === 'Ink') {
@@ -384,7 +415,7 @@ function addGeometry(doc, pageIndex, a, dx, dy, ledger) {
       Type: 'Annot', Subtype: 'Ink',
       Rect: r, C: a.color.slice(0, 3),
       BS: ctx.obj({ W: 1.5 }),
-      Contents: PDFString.of(a.contents || ''), F: 4,
+      Contents: pdfText(a.contents), F: 4,
     });
     dict.set(PDFName.of('InkList'), inkArr);
   }
@@ -397,10 +428,10 @@ function addSticky(doc, pageIndex, x, y, contents, color, ledger) {
   const dict = ctx.obj({
     Type: 'Annot', Subtype: 'Text',
     Rect: [x - 12, y - 12, x + 12, y + 12],
-    Contents: PDFString.of(contents),
+    Contents: pdfText(contents),
     C: color.slice(0, 3),
     Name: 'Note',
-    T: PDFString.of('Stale annotation'),
+    T: pdfText('Stale annotation'),
     F: 4, Open: false,
   });
   appendAnnot(page, ctx, dict, ledger);
@@ -619,6 +650,8 @@ async function readAllAnnotationsPdfjs(pdf) {
         contents: a.contentsObj?.str || a.contents || '',
         quads: pdfjsQuads(a.quadPoints),
         inkList: pdfjsInk(a.inkLists),
+        // Preserved for FreeText so we can write back the original font + color.
+        defaultAppearanceData: a.defaultAppearanceData || null,
       });
     }
   }
@@ -738,38 +771,25 @@ function yieldToUI() { return new Promise((r) => setTimeout(r, 0)); }
 // Share / download
 // ---------------------------------------------------------------------------
 
-// Single-fire lock — prevents a second click of the share button from
-// triggering a second download while the first is still in-flight.
+// Direct download only. We used to call navigator.share on touch devices
+// for the iOS share sheet, but on macOS Safari (and some iOS configurations)
+// that produces TWO files: the real PDF and a tiny .webloc shortcut named
+// after it. Direct download via a click on an <a download> gives exactly
+// one file and works the same on iPad (the file lands in the Downloads
+// manager → user can Open In → PDF Expert / Files / etc.).
 let sharing = false;
-
 export async function shareOrDownload(blob, filename) {
   if (sharing) return { shared: false, busy: true };
   sharing = true;
   try {
-    // On a touch device the iOS/iPadOS share sheet is the right UX; on
-    // desktop, calling navigator.share triggers Safari's share menu but
-    // many platforms ALSO drop a file in ~/Downloads, producing two files.
-    // Just download on desktop.
-    const touch = ('ontouchstart' in window) || (navigator.maxTouchPoints || 0) > 1;
-    const file = new File([blob], filename, { type: 'application/pdf' });
-    if (touch && navigator.canShare && navigator.canShare({ files: [file] })) {
-      try {
-        await navigator.share({ files: [file], title: filename });
-        return { shared: true };
-      } catch (err) {
-        if (err && err.name === 'AbortError') return { shared: false, cancelled: true };
-        // Any other error → fall through to download.
-      }
-    }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = filename;
+    a.href = url; a.download = filename; a.rel = 'noopener';
     document.body.appendChild(a); a.click();
     await new Promise((r) => setTimeout(r, 600));
     URL.revokeObjectURL(url); a.remove();
     return { shared: false };
   } finally {
-    // Brief cooldown so a stray second click is debounced.
     setTimeout(() => { sharing = false; }, 1200);
   }
 }
